@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Sound Canvas v2 (Debug - Simplified PluckSynth)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        body { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 100vh; background-color: #1a202c; color: #e2e8f0; font-family: sans-serif; overflow: hidden; }
+        #video-container { position: relative; width: 90%; max-width: 600px; aspect-ratio: 4/3; overflow: hidden; border-radius: 0.5rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05); margin-bottom: 1rem; }
+        #cameraFeed { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        #interactionOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+        #controls { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; margin-bottom: 1rem; }
+        .control-group { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; padding: 0.5rem; background-color: #2d3748; border-radius: 0.375rem; margin-bottom:0.5rem; }
+        .mode-buttons button { background-color: #4a5568; hover:bg-indigo-700; margin: 0 0.25rem; }
+        .mode-buttons button.active { background-color: #4c51bf; font-weight: bold; }
+        #messageBox { margin-top: 0.5rem; padding: 0.75rem; background-color: #2d3748; color: #e2e8f0; border-radius: 0.25rem; min-height: 3em; font-size: 0.85rem; text-align: center; width: 90%; max-width: 600px; line-height: 1.4; }
+        .tracer-control { display: flex; align-items: center; gap: 0.5rem; color: #a0aec0; font-size: 0.875rem; }
+        #tracerSlider { accent-color: #6366f1; }
+    </style>
+</head>
+<body class="p-4">
+    <h1 class="text-3xl font-bold mb-4">Interactive Sound Canvas</h1>
+    <div id="video-container">
+        <video id="cameraFeed" autoplay playsinline></video>
+        <canvas id="interactionOverlay"></canvas>
+    </div>
+
+    <div id="controls">
+        <div class="control-group">
+            <div id="handTrackingToggleContainer" class="flex items-center">
+                <input type="checkbox" id="handTrackingMasterToggle" class="mr-2 w-5 h-5 accent-green-400">
+                <label for="handTrackingMasterToggle" class="text-sm font-medium">Enable Hand Tracking</label>
+            </div>
+            <div id="handModeSelection" class="mode-buttons hidden mt-2">
+                <button id="thereminModeButton" class="py-1 px-3 rounded text-xs">Theremin</button>
+                <button id="harpModeButton" class="py-1 px-3 rounded text-xs">Harp</button>
+            </div>
+        </div>
+        <div class="control-group tracer-control">
+            <label for="tracerSlider">Tracer Length:</label>
+            <input type="range" id="tracerSlider" min="10" max="200" value="80" class="w-32">
+        </div>
+        <button id="stopButton" class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg shadow-md">
+            Stop All Sound
+        </button>
+    </div>
+    <div id="messageBox">Initializing...</div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <script>
+        window.onload = async function() {
+            const cameraFeed = document.getElementById('cameraFeed');
+            const interactionOverlay = document.getElementById('interactionOverlay');
+            const overlayCtx = interactionOverlay.getContext('2d');
+            const stopButton = document.getElementById('stopButton');
+            const messageBox = document.getElementById('messageBox');
+            const handTrackingMasterToggle = document.getElementById('handTrackingMasterToggle');
+            const handModeSelectionDiv = document.getElementById('handModeSelection');
+            const thereminModeButton = document.getElementById('thereminModeButton');
+            const harpModeButton = document.getElementById('harpModeButton');
+            const tracerSlider = document.getElementById('tracerSlider');
+
+            let currentOperatingMode = 'mouse';
+            let handTrackingEnabled = false;
+            let isSoundPlaying = false; 
+            let tracerLifetimeBase = parseInt(tracerSlider.value);
+            const tracers = [];
+            let lastFrameTime = performance.now();
+
+            const thereminSynth = new Tone.Synth({ oscillator: { type: 'sine' }, envelope: { attack: 0.01, decay: 0.1, sustain: 0.2, release: 0.5 } }).toDestination();
+            
+            // === SIMPLIFIED PluckSynth INITIALIZATION ===
+            const harpSynth = new Tone.PluckSynth().toDestination();
+            harpSynth.volume.value = 0; // Max volume for harp synth for testing
+            // ===========================================
+
+            const THEREMIN_MIN_PITCH = 130.81, THEREMIN_MAX_PITCH = 1046.50, THEREMIN_MIN_VOLUME = -30, THEREMIN_MAX_VOLUME = 0;
+            const CONTROL_POINT_INDEX = 8; 
+
+            const NUM_HARP_STRINGS = 30; 
+            const HARP_CHROMATIC_NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+            let currentHarpOctave = 3;
+            const harpStrings = [];
+            let lastPluckHandY = {};
+
+            function displayMessage(msg) { messageBox.textContent = msg; }
+            function updateActiveButtonStates() {
+                thereminModeButton.classList.toggle('active', handTrackingEnabled && currentOperatingMode === 'theremin');
+                harpModeButton.classList.toggle('active', handTrackingEnabled && currentOperatingMode === 'harp');
+                if (!handTrackingEnabled) currentOperatingMode = 'mouse';
+            }
+
+            function playThereminSound(pitch, volume) {
+                if (Tone.context.state !== 'running') return false;
+                pitch = Math.max(THEREMIN_MIN_PITCH, Math.min(THEREMIN_MAX_PITCH, pitch));
+                volume = Math.max(THEREMIN_MIN_VOLUME, Math.min(THEREMIN_MAX_VOLUME, volume));
+                thereminSynth.frequency.setValueAtTime(pitch, Tone.now());
+                thereminSynth.volume.setValueAtTime(volume, Tone.now());
+                if (!isSoundPlaying) { thereminSynth.triggerAttack(pitch, Tone.now()); isSoundPlaying = true; }
+                displayMessage(`Theremin: P ${pitch.toFixed(0)}Hz, V ${volume.toFixed(1)}dB`);
+                return true;
+            }
+
+            function pluckHarpString(stringIndex, velocity = 0.7) {
+                if (Tone.context.state !== 'running') {
+                    console.error("Harp Pluck Aborted: Audio context not running!");
+                    return;
+                }
+                if (stringIndex < 0 || stringIndex >= harpStrings.length) {
+                    console.error("Harp Pluck Aborted: Invalid stringIndex", stringIndex);
+                    return;
+                }
+
+                const noteToPlay = harpStrings[stringIndex].note;
+                if (!noteToPlay || typeof noteToPlay !== 'string' || noteToPlay.length < 2) { 
+                    console.error("Harp Pluck Aborted: Invalid note for string", stringIndex, "Note was:", noteToPlay); 
+                    return; 
+                }
+
+                let playVelocity = velocity; 
+
+                // --- TEMPORARY DEBUGGING FOR VELOCITY (FORCED HIGH) ---
+                playVelocity = 0.9; 
+                // --- END TEMPORARY DEBUGGING ---
+
+
+                console.log(`INSIDE pluckHarpString: Plucking ${noteToPlay} with velocity ${playVelocity.toFixed(2)}, Tone.context.state: ${Tone.context.state}`);
+                
+                try {
+                    harpSynth.triggerAttackRelease(noteToPlay, "4n", Tone.now(), playVelocity); 
+                } catch (e) {
+                    console.error("Tone.js harpSynth.triggerAttackRelease ERROR:", e);
+                }
+                
+                harpStrings[stringIndex].highlightTime = tracerLifetimeBase / 2;
+                addTracer(harpStrings[stringIndex].xPos * interactionOverlay.width, 0, 'harp_streamer', noteToPlay);
+                displayMessage(`Harp: Plucked ${noteToPlay} (Oct ${currentHarpOctave}) Vel: ${playVelocity.toFixed(2)}`);
+            }
+
+            function stopAllSound(source = "Button") {
+                thereminSynth.triggerRelease(Tone.now());
+                isSoundPlaying = false; 
+                displayMessage(`Sound stopped (${source}). Mode: ${currentOperatingMode}`);
+            }
+            stopButton.addEventListener('click', () => stopAllSound());
+
+            function handleMouseTouchInteraction(event) {
+                if (currentOperatingMode !== 'mouse') return;
+                const rect = interactionOverlay.getBoundingClientRect();
+                const clientX = event.touches ? event.touches[0].clientX : event.clientX;
+                const clientY = event.touches ? event.touches[0].clientY : event.clientY;
+                const x = clientX - rect.left;
+                const y = clientY - rect.top;
+                const normX = Math.max(0, Math.min(1, x / rect.width));
+                const normY = Math.max(0, Math.min(1, y / rect.height));
+
+                const pitch = THEREMIN_MIN_PITCH + normX * (THEREMIN_MAX_PITCH - THEREMIN_MIN_PITCH);
+                const volume = THEREMIN_MIN_VOLUME + (1 - normY) * (THEREMIN_MAX_VOLUME - THEREMIN_MIN_VOLUME);
+                if (playThereminSound(pitch, volume)) {
+                    addTracer(x, y, 'mouse_theremin');
+                }
+            }
+            interactionOverlay.addEventListener('mousemove', handleMouseTouchInteraction);
+            interactionOverlay.addEventListener('touchmove', (event) => { event.preventDefault(); handleMouseTouchInteraction(event); }, { passive: false });
+            interactionOverlay.addEventListener('mouseleave', () => { if (currentOperatingMode === 'mouse' && isSoundPlaying) stopAllSound("Mouse Left"); });
+            interactionOverlay.addEventListener('touchend', () => { if (currentOperatingMode === 'mouse' && isSoundPlaying) stopAllSound("Touch End"); });
+
+
+            const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+            hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.55, minTrackingConfidence: 0.55 });
+
+            function onHandResults(results) {
+                const currentTime = performance.now();
+                const deltaTime = (currentTime - lastFrameTime) / 1000.0; 
+                lastFrameTime = currentTime;
+
+                overlayCtx.clearRect(0, 0, interactionOverlay.width, interactionOverlay.height);
+                if (handTrackingEnabled && currentOperatingMode === 'harp') drawHarpStrings();
+                drawTracers();
+
+                if (!handTrackingEnabled || !results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                    if (isSoundPlaying && currentOperatingMode === 'theremin') stopAllSound("Hands Lost");
+                    if(handTrackingEnabled) displayMessage(currentOperatingMode === 'harp' ? "Harp: Awaiting 2 hands" : "Theremin: Awaiting hands");
+                    return;
+                }
+                
+                results.multiHandLandmarks.forEach((landmarks, i) => {
+                    const handednessLabel = results.multiHandedness[i].label;
+                    const drawColor = (handednessLabel === 'Left') ? '#00FF00' : '#00FFFF';
+                    drawConnectors(overlayCtx, landmarks, HAND_CONNECTIONS, { color: drawColor, lineWidth: 3 });
+                    drawLandmarks(overlayCtx, landmarks, { color: '#FFFFFF', lineWidth: 1, radius: 3 });
+                });
+
+                if (currentOperatingMode === 'theremin') handleThereminMode(results);
+                else if (currentOperatingMode === 'harp') handleHarpMode(results, deltaTime);
+            }
+            hands.onResults(onHandResults);
+
+            function handleThereminMode(results) {
+                let pitchHand, volumeHand;
+                if (results.multiHandLandmarks.length === 1) { 
+                    pitchHand = volumeHand = results.multiHandLandmarks[0];
+                    const ctrlPt = pitchHand[CONTROL_POINT_INDEX];
+                    const normX = 1.0 - ctrlPt.x; 
+                    const normY = ctrlPt.y;
+                    if(playThereminSound(
+                        THEREMIN_MIN_PITCH + normX * (THEREMIN_MAX_PITCH - THEREMIN_MIN_PITCH),
+                        THEREMIN_MIN_VOLUME + (1 - normY) * (THEREMIN_MAX_VOLUME - THEREMIN_MIN_VOLUME)
+                    )) {
+                         addTracer(ctrlPt.x * interactionOverlay.width, ctrlPt.y * interactionOverlay.height, 'theremin_single');
+                    }
+
+                } else if (results.multiHandLandmarks.length >= 2) {
+                    const hand1 = results.multiHandLandmarks[0];
+                    const hand2 = results.multiHandLandmarks[1];
+                    if (hand1[0].x < hand2[0].x) { pitchHand = hand1; volumeHand = hand2; } 
+                    else { pitchHand = hand2; volumeHand = hand1; }
+
+                    const pitchCtrlPt = pitchHand[CONTROL_POINT_INDEX];
+                    const volumeCtrlPt = volumeHand[CONTROL_POINT_INDEX];
+                    const normPitchX = 1.0 - pitchCtrlPt.x;
+                    const normVolumeY = volumeCtrlPt.y;
+
+                    if(playThereminSound(
+                        THEREMIN_MIN_PITCH + normPitchX * (THEREMIN_MAX_PITCH - THEREMIN_MIN_PITCH),
+                        THEREMIN_MIN_VOLUME + (1 - normVolumeY) * (THEREMIN_MAX_VOLUME - THEREMIN_MIN_VOLUME)
+                    )) {
+                        addTracer(pitchCtrlPt.x * interactionOverlay.width, pitchCtrlPt.y * interactionOverlay.height, 'theremin_pitch_hand');
+                        addTracer(volumeCtrlPt.x * interactionOverlay.width, volumeCtrlPt.y * interactionOverlay.height, 'theremin_volume_hand');
+                    }
+                } else {
+                     if (isSoundPlaying) stopAllSound("Theremin Hands Lost");
+                }
+            }
+
+            function handleHarpMode(results, deltaTime) { 
+                if (results.multiHandLandmarks.length < 2) {
+                    displayMessage("Harp Mode: Requires two hands.");
+                    return;
+                }
+
+                const hand1 = results.multiHandLandmarks[0];
+                const hand2 = results.multiHandLandmarks[1];
+                let octaveHand, pluckHand, pluckHandId;
+
+                if (hand1[0].x > hand2[0].x) { 
+                    octaveHand = hand1; 
+                    pluckHand = hand2; pluckHandId = results.multiHandedness[1].index; 
+                } else {
+                    octaveHand = hand2; 
+                    pluckHand = hand1; pluckHandId = results.multiHandedness[0].index; 
+                }
+
+                const octaveNormY = octaveHand[0].y; 
+                currentHarpOctave = 2 + Math.floor((1 - octaveNormY) * 3); 
+                currentHarpOctave = Math.max(2, Math.min(4, currentHarpOctave));
+                updateHarpStringNotes(); 
+
+                const pluckCtrlPt = pluckHand[CONTROL_POINT_INDEX]; 
+                const pluckNormX = 1.0 - pluckCtrlPt.x; 
+                const selectedStringIndex = Math.floor(pluckNormX * NUM_HARP_STRINGS);
+
+                const currentPluckHandY = pluckCtrlPt.y;
+                const prevPluckHandY = lastPluckHandY[pluckHandId] || currentPluckHandY;
+                
+                let ySpeed = 0;
+                if (deltaTime > 0.001) { 
+                    ySpeed = (currentPluckHandY - prevPluckHandY) / deltaTime; 
+                }
+
+                const PLUCK_SPEED_THRESHOLD = 0.3; 
+                                                  
+                console.log(`Harp Detect: HandId=${pluckHandId}, Y=${currentPluckHandY.toFixed(2)}, PrevY=${prevPluckHandY.toFixed(2)}, Speed=${ySpeed.toFixed(2)}, SelStr=${selectedStringIndex}, dT=${deltaTime.toFixed(3)}`);
+
+                if (ySpeed > PLUCK_SPEED_THRESHOLD && selectedStringIndex >= 0 && selectedStringIndex < NUM_HARP_STRINGS) {
+                    let velocity = Math.min(1, Math.max(0.2, ySpeed / 2.0)); 
+                    
+                    console.log(`PLUCKING! String: ${selectedStringIndex}, Note: ${harpStrings[selectedStringIndex]?.note}, Velocity: ${velocity.toFixed(2)}`);
+                    pluckHarpString(selectedStringIndex, velocity);
+                }
+                lastPluckHandY[pluckHandId] = currentPluckHandY;
+                
+                if (selectedStringIndex >= 0 && selectedStringIndex < NUM_HARP_STRINGS) {
+                     overlayCtx.fillStyle = "rgba(255, 255, 100, 0.2)"; 
+                     overlayCtx.fillRect(harpStrings[selectedStringIndex].xPos * interactionOverlay.width - 2, 0, 4, interactionOverlay.height);
+                }
+                displayMessage(`Harp Oct: ${currentHarpOctave}. L.Hand(Y):Oct, R.Hand(X):Select Str, R.Hand(Flick Down):Pluck (Speed: ${ySpeed.toFixed(1)})`);
+            }
+
+            function updateHarpStringNotes() {
+                for (let i = 0; i < NUM_HARP_STRINGS; i++) {
+                    const noteIndex = i % HARP_CHROMATIC_NOTES.length;
+                    const octaveOffset = Math.floor(i / HARP_CHROMATIC_NOTES.length);
+                    harpStrings[i].note = HARP_CHROMATIC_NOTES[noteIndex] + (currentHarpOctave + octaveOffset);
+                    harpStrings[i].isNatural = !HARP_CHROMATIC_NOTES[noteIndex].includes("#");
+                }
+            }
+            
+            function initializeHarpStrings() {
+                harpStrings.length = 0; 
+                for (let i = 0; i < NUM_HARP_STRINGS; i++) {
+                    harpStrings.push({
+                        xPos: (i + 0.5) / NUM_HARP_STRINGS,
+                        note: '', 
+                        highlightTime: 0,
+                        isNatural: true 
+                    });
+                }
+                updateHarpStringNotes(); 
+            }
+            initializeHarpStrings();
+
+            function drawHarpStrings() {
+                harpStrings.forEach((str) => {
+                    overlayCtx.lineWidth = str.highlightTime > 0 ? 3 : (str.isNatural ? 1.5 : 0.8); 
+                    overlayCtx.strokeStyle = str.highlightTime > 0 ? "yellow" : (str.isNatural ? "rgba(220, 220, 255, 0.7)" : "rgba(180, 180, 220, 0.5)"); 
+                    overlayCtx.beginPath();
+                    overlayCtx.moveTo(str.xPos * interactionOverlay.width, 0);
+                    overlayCtx.lineTo(str.xPos * interactionOverlay.width, interactionOverlay.height);
+                    overlayCtx.stroke();
+                    if (str.highlightTime > 0) str.highlightTime--;
+                });
+            }
+            
+            tracerSlider.addEventListener('input', (e) => tracerLifetimeBase = parseInt(e.target.value));
+            function addTracer(x, y, type, data = null) {
+                 tracers.push({
+                    x, y, type, data,
+                    opacity: 1.0,
+                    vy: type === 'harp_streamer' ? 2 : 0, 
+                    size: type === 'harp_streamer' ? 5 : 3,
+                    color: type.includes('theremin') ? `rgba(0, 255, 255,` : (type==='mouse_theremin' ? `rgba(255,0,255,` : `rgba(255, 223, 0,`), 
+                    lifetime: tracerLifetimeBase
+                });
+            }
+
+            function drawTracers() {
+                 for (let i = tracers.length - 1; i >= 0; i--) {
+                    const t = tracers[i];
+                    t.opacity = t.lifetime / tracerLifetimeBase;
+                    t.lifetime--;
+                    
+                    overlayCtx.beginPath();
+                    overlayCtx.fillStyle = t.color + `${t.opacity})`;
+                    
+                    if (t.type === 'harp_streamer') {
+                        t.y += t.vy; 
+                        overlayCtx.font = "10px Arial";
+                        overlayCtx.fillText(t.data, t.x - 5, t.y); 
+                        overlayCtx.fillRect(t.x - t.size/2, t.y + 5, t.size, t.size * 2.5); 
+                    } else { 
+                         overlayCtx.arc(t.x, t.y, t.size + t.opacity * 5, 0, Math.PI * 2);
+                         overlayCtx.fill();
+                    }
+
+                    if (t.lifetime <= 0 || (t.type === 'harp_streamer' && t.y > interactionOverlay.height + 20)) { 
+                        tracers.splice(i, 1);
+                    }
+                }
+            }
+
+            async function setupCamera() { 
+                 try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } } });
+                    cameraFeed.srcObject = stream;
+                    cameraFeed.onloadedmetadata = () => {
+                        cameraFeed.play();
+                        interactionOverlay.width = cameraFeed.clientWidth;
+                        interactionOverlay.height = cameraFeed.clientHeight;
+                        displayMessage('Camera active. Select mode or use mouse.');
+                        lastFrameTime = performance.now(); 
+                        requestAnimationFrame(processVideoFrame);
+                    };
+                    window.addEventListener('resize', () => {
+                        if (cameraFeed.srcObject) {
+                            interactionOverlay.width = cameraFeed.clientWidth;
+                            interactionOverlay.height = cameraFeed.clientHeight;
+                        }
+                    });
+                } catch (err) {
+                    console.error('Camera Error:', err);
+                    displayMessage('Error accessing camera. Grant permission & refresh.');
+                }
+            }
+            async function processVideoFrame() { 
+                if (cameraFeed.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && !cameraFeed.paused && !cameraFeed.ended) {
+                    try { await hands.send({ image: cameraFeed }); }
+                    catch (e) { console.error("MediaPipe Error:", e); }
+                }
+                requestAnimationFrame(processVideoFrame);
+            }
+
+            handTrackingMasterToggle.addEventListener('change', function() { 
+                handTrackingEnabled = this.checked;
+                if (isSoundPlaying && currentOperatingMode === 'theremin') stopAllSound("Mode Switch"); 
+                if (handTrackingEnabled) {
+                    handModeSelectionDiv.classList.remove('hidden');
+                    if (currentOperatingMode === 'mouse') currentOperatingMode = 'theremin'; 
+                    displayMessage(`Hand Tracking ON. Select Theremin or Harp mode.`);
+                    interactionOverlay.style.cursor = 'none';
+                } else {
+                    handModeSelectionDiv.classList.add('hidden');
+                    currentOperatingMode = 'mouse';
+                    displayMessage('Mouse/Touch Mode Active.');
+                    interactionOverlay.style.cursor = 'crosshair';
+                }
+                overlayCtx.clearRect(0, 0, interactionOverlay.width, interactionOverlay.height); 
+                updateActiveButtonStates();
+            });
+            thereminModeButton.addEventListener('click', () => {  
+                if (!handTrackingEnabled) return;
+                if (isSoundPlaying) stopAllSound("Mode Switch");
+                currentOperatingMode = 'theremin';
+                displayMessage('Theremin Mode Active. Use hands for pitch/volume.');
+                updateActiveButtonStates();
+            });
+            harpModeButton.addEventListener('click', () => { 
+                 if (!handTrackingEnabled) return;
+                currentOperatingMode = 'harp';
+                displayMessage('Harp Mode Active. L.Hand(Y):Oct, R.Hand(X):Select, R.Hand(Flick Down):Pluck');
+                updateActiveButtonStates();
+            });
+            
+            async function resumeAudio() { 
+                if (Tone.context.state !== 'running') {
+                    try { 
+                        await Tone.start(); 
+                        console.log('Audio context started.'); 
+                        displayMessage('Audio ready!');
+
+                        // **** TEST PLUCK ON AUDIO START ****
+                        if (harpSynth && Tone.context.state === 'running') {
+                            console.log("Attempting TEST PLUCK of C4 on harpSynth...");
+                            try {
+                                harpSynth.triggerAttackRelease("C4", "4n", Tone.now(), 0.9);
+                                console.log("TEST PLUCK of C4 supposedly triggered.");
+                            } catch (e) {
+                                console.error("ERROR during TEST PLUCK:", e);
+                            }
+                        }
+                        // **** END TEST PLUCK ****
+
+                    }
+                    catch (e) { console.error("Audio start error:", e); displayMessage('Audio failed. Click page.'); }
+                } else { 
+                    displayMessage('Audio ready.');
+                     // **** ALSO TEST PLUCK IF ALREADY RUNNING ****
+                    if (harpSynth && Tone.context.state === 'running') {
+                        console.log("Attempting TEST PLUCK of C4 on already running context...");
+                         try {
+                            harpSynth.triggerAttackRelease("C4", "4n", Tone.now(), 0.9);
+                            console.log("TEST PLUCK of C4 (already running context) supposedly triggered.");
+                        } catch (e) {
+                            console.error("ERROR during TEST PLUCK (already running):", e);
+                        }
+                    }
+                }
+            }
+            document.body.addEventListener('mousedown', resumeAudio, { once: true });
+            document.body.addEventListener('touchstart', resumeAudio, { once: true, passive: true });
+
+            setupCamera();
+            displayMessage('Click page to enable audio, then grant camera access.');
+            updateActiveButtonStates();
+        };
+    </script>
+</body>
+</html>
